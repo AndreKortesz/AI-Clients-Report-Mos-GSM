@@ -15,6 +15,19 @@ PROVIDERS_MSG = {
     if p.strip()
 }
 
+PROVIDERS_TYPE = {
+    p.strip().upper()
+    for p in (os.getenv("PROVIDERS_TYPE") or "").split(",")
+    if p.strip()
+}
+
+def _is_message_activity(row):
+    prov = (row.get("PROVIDER_ID") or "").upper()
+    ptype = (row.get("PROVIDER_TYPE_ID") or "").upper()
+    ok_by_id = prov in PROVIDERS_MSG
+    ok_by_type = (PROVIDERS_TYPE and ptype in PROVIDERS_TYPE)
+    return ok_by_id or ok_by_type
+
 # Типы сущностей в Bitrix
 # 1 - Лид, 2 - Контакт, 3 - Компания, 4 - Сделка
 TRACK_ENTITY_TYPES = set((os.getenv("ENTITY_TYPES") or "1,2,3,4").split(","))
@@ -32,8 +45,8 @@ def fetch_recent_incoming_messages():
     rows = list_activities(flt, order={"CREATED":"DESC"}, select=select)
     # Отфильтруем только нужные провайдеры и сущности
     return [r for r in rows
-            if str(r.get("OWNER_TYPE_ID")) in TRACK_ENTITY_TYPES
-            and (r.get("PROVIDER_ID") or "").upper() in PROVIDERS_MSG]
+        if str(r.get("OWNER_TYPE_ID")) in TRACK_ENTITY_TYPES
+        and _is_message_activity(r)]
 
 def has_outgoing_reply_after(entity_type_id, entity_id, t_from_iso):
     flt = {
@@ -50,15 +63,34 @@ def has_outgoing_reply_after(entity_type_id, entity_id, t_from_iso):
             return True
     return False
 
+from bitrix import list_activities, list_calls_since
+
 def has_success_call_after(entity_type_id, entity_id, t_from_iso, phone):
-    calls = list_calls_since(t_from_iso, entity_type_id=int(entity_type_id), entity_id=int(entity_id), phone=phone)
+    # 1) Сначала проверим журнал телефонии (быстрее и надёжнее)
+    calls = list_calls_since(t_from_iso,
+                             entity_type_id=int(entity_type_id),
+                             entity_id=int(entity_id),
+                             phone=phone)
     for c in calls:
-        # CALL_TYPE: 1 inbound, 2 outbound
-        # CALL_FAILED: 'Y'/'N'
-        if str(c.get("CALL_FAILED","N")).upper() == "Y":
-            continue
-        # Успешный входящий или исходящий — считаем «погасившим» тревогу
-        return True
+        if str(c.get("CALL_FAILED","N")).upper() != "Y":
+            return True  # успешный входящий или исходящий после входящего сообщения
+
+    # 2) Фоллбек: проверим CRM-активности звонка (VOXIMPLANT_CALL / CALL)
+    rows = list_activities(
+        {
+            "OWNER_TYPE_ID": int(entity_type_id),
+            "OWNER_ID": int(entity_id),
+            ">CREATED": t_from_iso,
+            "PROVIDER_ID": ["VOXIMPLANT_CALL", "CALL"]
+        },
+        order={"CREATED": "ASC"},
+        select=["ID","CREATED","PROVIDER_ID","DIRECTION","COMPLETED","SETTINGS"]
+    )
+    for r in rows:
+        # считаем любой завершённый звонок достаточным
+        if (r.get("COMPLETED") == "Y") or (str(r.get("DIRECTION","0")) in ("1","2")):
+            return True
+
     return False
 
 def communications_first_phone(comms):
