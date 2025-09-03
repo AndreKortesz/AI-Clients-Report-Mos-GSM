@@ -6,6 +6,9 @@ from bitrix import list_activities, list_calls_since
 # === Настройки ===
 WINDOW_DAYS = int(os.getenv("WINDOW_DAYS", "14"))
 RESPONSE_SLA_MIN = int(os.getenv("RESPONSE_SLA_MIN", "45"))
+MAX_ROWS_INCOMING = int(os.getenv("MAX_ROWS_INCOMING", "1500"))   # сколько входящих максимум забираем за раз
+MAX_ROWS_REPLY    = int(os.getenv("MAX_ROWS_REPLY", "300"))       # проверка исходящих после входящего
+MAX_ROWS_CALL_ACT = int(os.getenv("MAX_ROWS_CALL_ACT", "200"))    # проверка звонковых активностей
 
 # Каналы-провайдеры, которые считаем "перепиской" (по PROVIDER_ID)
 PROVIDERS_MSG = {
@@ -22,7 +25,7 @@ PROVIDERS_TYPE = {
 }
 
 def _is_message_activity(row: dict) -> bool:
-    """Возвращает True, если активность относится к переписке по нашим правилам."""
+    """True, если активность относится к переписке по нашим правилам."""
     prov = (row.get("PROVIDER_ID") or "").upper()
     ptype = (row.get("PROVIDER_TYPE_ID") or "").upper()
     ok_by_id = prov in PROVIDERS_MSG
@@ -44,12 +47,17 @@ def fetch_recent_incoming_messages():
         ">=CREATED": _iso(since),
         "DIRECTION": 2,  # incoming от клиента
     }
-    # ВАЖНО: включаем PROVIDER_TYPE_ID — он нужен для фильтра по типам (WHATSAPP и т.д.)
+    # ВАЖНО: включаем PROVIDER_TYPE_ID — нужен для фильтра по типам (WHATSAPP и т.д.)
     select = [
         "ID","CREATED","PROVIDER_ID","PROVIDER_TYPE_ID","SUBJECT",
         "OWNER_TYPE_ID","OWNER_ID","COMMUNICATIONS","AUTHOR_ID","DESCRIPTION"
     ]
-    rows = list_activities(flt, order={"CREATED": "DESC"}, select=select)
+    rows = list_activities(
+        flt,
+        order={"CREATED": "DESC"},
+        select=select,
+        max_rows=MAX_ROWS_INCOMING
+    )
 
     # Оставляем только нужные сущности и только переписку
     return [
@@ -65,9 +73,14 @@ def has_outgoing_reply_after(entity_type_id, entity_id, t_from_iso: str) -> bool
         ">CREATED": t_from_iso,
         "DIRECTION": 1,  # outgoing от менеджера
     }
-    # Тоже берём PROVIDER_TYPE_ID, чтобы учесть фильтр по типам
+    # Берём PROVIDER_TYPE_ID, чтобы учесть фильтр по типам
     select = ["ID","CREATED","PROVIDER_ID","PROVIDER_TYPE_ID","AUTHOR_ID"]
-    rows = list_activities(flt, order={"CREATED": "ASC"}, select=select)
+    rows = list_activities(
+        flt,
+        order={"CREATED": "ASC"},
+        select=select,
+        max_rows=MAX_ROWS_REPLY
+    )
     for r in rows:
         if _is_message_activity(r):
             return True
@@ -96,7 +109,8 @@ def has_success_call_after(entity_type_id, entity_id, t_from_iso: str, phone: st
             "PROVIDER_ID": ["VOXIMPLANT_CALL", "CALL"],
         },
         order={"CREATED": "ASC"},
-        select=["ID","CREATED","PROVIDER_ID","DIRECTION","COMPLETED","SETTINGS"]
+        select=["ID","CREATED","PROVIDER_ID","DIRECTION","COMPLETED","SETTINGS"],
+        max_rows=MAX_ROWS_CALL_ACT
     )
     for r in rows:
         # Любой завершённый звонок или наличие направления 1/2 считаем достаточным
@@ -114,8 +128,13 @@ def communications_first_phone(comms):
 
 # === Главный детектор тревог ===
 def detect_alerts():
-    """Возвращает список:
-       { 'owner_type_id', 'owner_id', 'last_in_created', 'provider_id', 'phone', 'activity_id', 'subject' }"""
+    """
+    Возвращает список словарей:
+    {
+      'owner_type_id', 'owner_id', 'last_in_created',
+      'provider_id', 'phone', 'activity_id', 'subject'
+    }
+    """
     incomings = fetch_recent_incoming_messages()
     alerts = []
 
@@ -129,4 +148,31 @@ def detect_alerts():
     now_utc = datetime.now(timezone.utc)
 
     for (etype, eid), last in latest_by_entity.items():
-        # Строки
+        # 'Z' -> '+00:00' для совместимости с fromisoformat
+        created_raw = str(last["CREATED"])
+        t_in = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+
+        # Ждём SLA
+        if (now_utc - t_in).total_seconds() < RESPONSE_SLA_MIN * 60:
+            continue
+
+        # Был ли исходящий ответ после входящего
+        if has_outgoing_reply_after(etype, eid, _iso(t_in)):
+            continue
+
+        # Был ли звонок после входящего
+        phone = communications_first_phone(last.get("COMMUNICATIONS"))
+        if has_success_call_after(etype, eid, _iso(t_in), phone):
+            continue
+
+        alerts.append({
+            "owner_type_id": etype,
+            "owner_id": eid,
+            "last_in_created": last["CREATED"],
+            "provider_id": last.get("PROVIDER_ID"),
+            "phone": phone,
+            "activity_id": last.get("ID"),
+            "subject": last.get("SUBJECT") or "",
+        })
+
+    return alerts
