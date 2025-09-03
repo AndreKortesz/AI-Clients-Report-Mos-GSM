@@ -9,8 +9,11 @@ WINDOW_DAYS = int(os.getenv("WINDOW_DAYS", "14"))
 RESPONSE_SLA_MIN = int(os.getenv("RESPONSE_SLA_MIN", "45"))
 
 # Каналы-провайдеры, которые считаем "перепиской"
-PROVIDERS_MSG = set((os.getenv("PROVIDERS_MSG") or
-    "IMOPENLINES,OPENLINE,WHATSAPP,TELEGRAMBOT,EMAIL")).split(","))
+PROVIDERS_MSG = {
+    p.strip().upper()
+    for p in (os.getenv("PROVIDERS_MSG") or "IMOPENLINES,OPENLINE,WHATSAPP,TELEGRAMBOT,EMAIL").split(",")
+    if p.strip()
+}
 
 # Типы сущностей в Bitrix
 # 1 - Лид, 2 - Контакт, 3 - Компания, 4 - Сделка
