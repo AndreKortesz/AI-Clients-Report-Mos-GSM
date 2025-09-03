@@ -14,19 +14,27 @@ def b24(method: str, params: dict):
         time.sleep(1 + i)
     r.raise_for_status()
 
-def list_activities(filter_, order=None, select=None, start=0):
+def list_activities(filter_, order=None, select=None, start=0, max_rows=None):
     params = {"filter": filter_}
     if order: params["order"] = order
     if select: params["select"] = select
     params["start"] = start
-    res = b24("crm.activity.list", params)
-    result = res.get("result", [])
-    next_ = res.get("next")
-    while isinstance(next_, int):
-        params["start"] = next_
+
+    result = []
+    while True:
         res = b24("crm.activity.list", params)
-        result.extend(res.get("result", []))
+        chunk = res.get("result", []) or []
+        result.extend(chunk)
+
+        # если задан лимит — обрежем и выйдем
+        if max_rows is not None and len(result) >= max_rows:
+            return result[:max_rows]
+
         next_ = res.get("next")
+        if not isinstance(next_, int):
+            break
+        params["start"] = next_
+
     return result
 
 def list_calls_since(since_iso: str, entity_type_id=None, entity_id=None, phone=None):
