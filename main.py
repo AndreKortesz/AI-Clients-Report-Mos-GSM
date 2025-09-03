@@ -39,3 +39,89 @@ async def bitrix_events(request: Request):
     # Здесь можно ловить onCrmActivityAdd / onTelephonyCallEnd и запускать узкий анализ.
     # Пока просто подтверждаем.
     return {"result": "ok", "echo": data}
+
+from datetime import datetime, timedelta, timezone
+from collections import Counter
+from fastapi import Query
+from bitrix import list_activities
+
+def _iso(dt): 
+    return dt.astimezone(timezone.utc).isoformat()
+
+@app.get("/debug/last-incomings")
+def debug_last_incomings(
+    days: int = Query(30, ge=1, le=365),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """
+    Последние входящие активности (DIRECTION=2) за N дней.
+    Вернём ID, CREATED, PROVIDER_ID, PROVIDER_TYPE_ID, OWNER_TYPE/ID.
+    """
+    since = _iso(datetime.now(timezone.utc) - timedelta(days=days))
+    rows = list_activities(
+        {"DIRECTION": 2, ">=CREATED": since},
+        order={"CREATED": "DESC"},
+        select=[
+            "ID","CREATED","PROVIDER_ID","PROVIDER_TYPE_ID","DIRECTION",
+            "OWNER_TYPE_ID","OWNER_ID","COMMUNICATIONS","AUTHOR_ID","SUBJECT"
+        ]
+    )
+    return rows[:limit]
+
+@app.get("/debug/providers-summary")
+def debug_providers_summary(
+    days: int = Query(30, ge=1, le=365),
+    limit: int = Query(2000, ge=100, le=10000),
+):
+    """
+    Сводка по каналам за N дней: сколько входящих по каждому PROVIDER_ID/TYPE.
+    Увеличивай limit, если мало записей.
+    """
+    since = _iso(datetime.now(timezone.utc) - timedelta(days=days))
+    rows = list_activities(
+        {"DIRECTION": 2, ">=CREATED": since},
+        order={"CREATED": "DESC"},
+        select=["PROVIDER_ID","PROVIDER_TYPE_ID"]
+    )
+    rows = rows[:limit]
+
+    by_provider = Counter((r.get("PROVIDER_ID") or "").upper() for r in rows)
+    by_type = Counter((r.get("PROVIDER_TYPE_ID") or "").upper() for r in rows)
+
+    # Сводка в виде удобного JSON
+    return {
+        "total_sampled": len(rows),
+        "by_PROVIDER_ID": [
+            {"PROVIDER_ID": k or "(empty)", "count": v}
+            for k, v in by_provider.most_common()
+        ],
+        "by_PROVIDER_TYPE_ID": [
+            {"PROVIDER_TYPE_ID": k or "(empty)", "count": v}
+            for k, v in by_type.most_common()
+        ]
+    }
+
+@app.get("/debug/activities-by-entity")
+def debug_activities_by_entity(
+    owner_type_id: int = Query(..., description="1=Лид, 2=Контакт, 3=Компания, 4=Сделка"),
+    owner_id: int = Query(...),
+    days: int = Query(60, ge=1, le=365),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    """
+    Все активности по конкретной сущности за N дней — удобно смотреть конкретный кейс.
+    """
+    since = _iso(datetime.now(timezone.utc) - timedelta(days=days))
+    rows = list_activities(
+        {
+            "OWNER_TYPE_ID": owner_type_id,
+            "OWNER_ID": owner_id,
+            ">=CREATED": since,
+        },
+        order={"CREATED": "DESC"},
+        select=[
+            "ID","CREATED","TYPE_ID","PROVIDER_ID","PROVIDER_TYPE_ID","DIRECTION",
+            "SUBJECT","COMPLETED","AUTHOR_ID"
+        ]
+    )
+    return rows[:limit]
