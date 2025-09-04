@@ -12,24 +12,28 @@ MAX_ROWS_CALL_ACT = int(os.getenv("MAX_ROWS_CALL_ACT", "200"))    # провер
 
 # Каналы-провайдеры, которые считаем "перепиской" (по PROVIDER_ID)
 PROVIDERS_MSG = {
-    p.strip().upper()
-    for p in (os.getenv("PROVIDERS_MSG") or "IMOPENLINES,OPENLINE,WHATSAPP,TELEGRAMBOT,EMAIL").split(",")
-    if p.strip()
+    (p or "").strip().upper()
+    for p in (os.getenv("PROVIDERS_MSG") or "IMOPENLINES_SESSION,CRM_EMAIL,WAZZUP").split(",")
+    if (p or "").strip()
 }
 
-# (Опц.) Каналы-подтипы (по PROVIDER_TYPE_ID), напр. WHATSAPP/TELEGRAM, если всё идёт через IMOPENLINES
+# (Опц.) Каналы-подтипы (по PROVIDER_TYPE_ID), напр. WHATSAPP/EMAIL/15
 PROVIDERS_TYPE = {
-    p.strip().upper()
-    for p in (os.getenv("PROVIDERS_TYPE") or "").split(",")
-    if p.strip()
+    str((p or "").strip()).upper()
+    for p in (os.getenv("PROVIDERS_TYPE") or "WHATSAPP,EMAIL,15").split(",")
+    if str((p or "").strip())
 }
+
+def _as_upper(v) -> str:
+    """Безопасно привести к строке и upper()."""
+    return str(v if v is not None else "").strip().upper()
 
 def _is_message_activity(row: dict) -> bool:
     """True, если активность относится к переписке по нашим правилам."""
-    prov = (row.get("PROVIDER_ID") or "").upper()
-    ptype = (row.get("PROVIDER_TYPE_ID") or "").upper()
-    ok_by_id = prov in PROVIDERS_MSG
-    ok_by_type = (len(PROVIDERS_TYPE) > 0 and ptype in PROVIDERS_TYPE)
+    prov  = _as_upper(row.get("PROVIDER_ID"))
+    ptype = _as_upper(row.get("PROVIDER_TYPE_ID"))
+    ok_by_id = prov in PROVIDERS_MSG if prov else False
+    ok_by_type = (len(PROVIDERS_TYPE) > 0 and ptype in PROVIDERS_TYPE) if ptype else False
     return ok_by_id or ok_by_type
 
 # Типы сущностей в Bitrix: 1-Лид, 2-Контакт, 3-Компания, 4-Сделка
@@ -39,6 +43,15 @@ TRACK_ENTITY_TYPES = {
 
 def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
+
+def _parse_b24_iso(s: str) -> datetime:
+    """Парсит дату из Bitrix (с Z или с оффсетом)."""
+    if not s:
+        return datetime.now(timezone.utc)
+    s = str(s)
+    if s.endswith("Z"):
+        s = s.replace("Z", "+00:00")
+    return datetime.fromisoformat(s)
 
 # === Поиск последних входящих сообщений ===
 def fetch_recent_incoming_messages():
@@ -123,7 +136,7 @@ def communications_first_phone(comms):
     if isinstance(comms, list) and comms:
         v = comms[0].get("VALUE")
         if v:
-            return v
+            return str(v)
     return None
 
 # === Главный детектор тревог ===
@@ -148,9 +161,9 @@ def detect_alerts():
     now_utc = datetime.now(timezone.utc)
 
     for (etype, eid), last in latest_by_entity.items():
-        # 'Z' -> '+00:00' для совместимости с fromisoformat
-        created_raw = str(last["CREATED"])
-        t_in = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+        # Парсим дату
+        created_raw = str(last.get("CREATED"))
+        t_in = _parse_b24_iso(created_raw)
 
         # Ждём SLA
         if (now_utc - t_in).total_seconds() < RESPONSE_SLA_MIN * 60:
@@ -168,7 +181,7 @@ def detect_alerts():
         alerts.append({
             "owner_type_id": etype,
             "owner_id": eid,
-            "last_in_created": last["CREATED"],
+            "last_in_created": created_raw,
             "provider_id": last.get("PROVIDER_ID"),
             "phone": phone,
             "activity_id": last.get("ID"),
