@@ -1,104 +1,209 @@
-import os, requests
+# bitrix.py
+from __future__ import annotations
 
-B24_WEBHOOK = os.getenv("B24_WEBHOOK", "").rstrip("/") + "/"
+import os
+import time
+import typing as t
+import requests
 
-def _b24_call(method: str, payload: dict):
-    url = f"{B24_WEBHOOK}{method}.json"
-    r = requests.post(url, json=payload, timeout=20)
-    # Если REST вернул HTTP 200, но в JSON есть error — это тоже ошибка метода/прав
-    data = {}
-    try:
-        r.raise_for_status()
-        data = r.json()
-    except Exception:
-        # попробуем вытащить JSON об ошибке, если он был
+# Базовый URL вебхука
+_B24 = (os.getenv("B24_WEBHOOK") or "").rstrip("/")
+if not _B24:
+    raise RuntimeError("Env B24_WEBHOOK is empty")
+
+# Сетевые таймауты/повторы
+_HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "25"))
+_RETRY = int(os.getenv("HTTP_RETRY", "2"))
+_RETRY_SLEEP = float(os.getenv("HTTP_RETRY_SLEEP", "0.8"))
+
+def _method_url(method: str) -> str:
+    return f"{_B24}/{method}.json"
+
+def _post(method: str, payload: dict) -> dict:
+    """Вызов метода Bitrix с базовой обработкой ошибок."""
+    url = _method_url(method)
+    last_exc = None
+    for i in range(_RETRY + 1):
         try:
+            r = requests.post(url, json=payload, timeout=_HTTP_TIMEOUT)
+            r.raise_for_status()
             data = r.json()
-        except Exception:
-            pass
-        raise
-    # Вернём и «сырой» ответ, чтобы понять error-код
-    return data
+            # Ошибки уровня Bitrix
+            if isinstance(data, dict) and "error" in data:
+                # Пробрасываем дальше — пусть вызывающий решит, что делать
+                raise RuntimeError(f"{data.get('error')}: {data.get('error_description')}")
+            return data
+        except (requests.RequestException, ValueError) as e:
+            last_exc = e
+            if i < _RETRY:
+                time.sleep(_RETRY_SLEEP)
+            else:
+                raise
+        except RuntimeError as e:
+            # Ошибка ядра Bitrix — не повторяем, сразу наружу
+            raise
+    # На всякий случай (сюда не дойдём)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Unknown request failure")
 
-def _collect_with_paging(method: str, base_payload: dict) -> list[dict]:
-    items = []
-    start = 0
+# ---------------------------
+#  Public helpers for logic.py
+# ---------------------------
+
+def list_activities(
+    flt: dict | None = None,
+    order: dict | None = None,
+    select: t.List[str] | None = None,
+    max_rows: int | None = None,
+) -> t.List[dict]:
+    """
+    Обёртка над crm.activity.list с постраничной выборкой.
+    :param flt: FILTER
+    :param order: ORDER
+    :param select: SELECT
+    :param max_rows: жёсткая отсечка по количеству записей
+    """
+    method = "crm.activity.list"
+    result: t.List[dict] = []
+    start: t.Any = 0
+
     while True:
-        payload = dict(base_payload)
-        payload["start"] = start
-        data = _b24_call(method, payload)
-        if isinstance(data, dict) and "error" in data:
-            # отдадим наверх — пусть решает вызывающий (сменит метод)
-            raise RuntimeError(f"{method}: {data.get('error')} - {data.get('error_description')}")
-        chunk = data.get("result", [])
-        if not isinstance(chunk, list):
-            chunk = []
-        items.extend(chunk)
+        payload = {
+            "filter": flt or {},
+            "order": order or {},
+            "select": select or [],
+            "start": start,
+        }
+        data = _post(method, payload)
+        page = data.get("result", []) or []
+        result.extend(page)
+
+        # лимит для защиты
+        if max_rows is not None and len(result) >= max_rows:
+            return result[:max_rows]
+
+        # пагинация Bitrix — если есть 'next', продолжаем
         next_start = data.get("next")
         if next_start is None:
             break
         start = next_start
-        if start == 0:
-            break
-    return items
+    return result
 
-def list_calls_since(t_from_iso: str, entity_type_id: int | None = None,
-                     entity_id: int | None = None, phone: str | None = None) -> list[dict]:
-    """
-    Возвращает список звонков из журнала телефонии, начиная с t_from_iso.
-    Сначала пробуем telephony.statistic.get, если «Method not found» — voximplant.statistic.get.
-    Также пробуем оба варианта поля даты: START_DATE / CALL_START_DATE.
-    """
-    # Базовый фильтр по дате (оба варианта ключа)
-    base_filters = [
-        {"FILTER": {">=START_DATE": t_from_iso}},
-        {"FILTER": {">=CALL_START_DATE": t_from_iso}},
-    ]
 
-    # Узкие фильтры (по сущности/телефону) — добавим во все варианты
-    def _attach_filters(f: dict) -> dict:
-        F = dict(f.get("FILTER", {}))
-        if entity_type_id is not None:
-            F["CRM_ENTITY_TYPE"] = int(entity_type_id)
-        if entity_id is not None:
-            F["CRM_ENTITY_ID"] = int(entity_id)
+def list_calls_since(
+    since_iso: str,
+    *,
+    entity_type_id: int | None = None,
+    entity_id: int | None = None,
+    phone: str | None = None,
+    max_rows: int | None = 2000,
+) -> t.List[dict]:
+    """
+    Возвращает список звонков (журнал телефонии) НОВЕЕ указанной даты.
+    Порядок попыток:
+      1) voximplant.statistic.get (классический)
+      2) telephony.statistic.get (на некоторых порталах)
+      3) Fallback: crm.activity.list с PROVIDER_ID=["VOXIMPLANT_CALL","CALL"]
+    """
+    # Унифицированный фильтр для API телефонии
+    def _calls_via(method: str) -> t.List[dict]:
+        res: t.List[dict] = []
+        start = 0
+        # фильтр может называться по-разному у порталов, но >=CALL_START_DATE работает в облаке Voximplant
+        base_filter = {
+            ">=CALL_START_DATE": since_iso,
+        }
+        # Дополнительные «сужения» фильтра
         if phone:
-            # по телефону в статистике обычно поле PHONE_NUMBER
-            F["PHONE_NUMBER"] = str(phone)
-        out = dict(f)
-        out["FILTER"] = F
-        # сортировка и лимит
-        out["ORDER"] = {"START_DATE": "ASC"}
-        out["LIMIT"] = 200
-        return out
+            base_filter["PHONE_NUMBER"] = phone
+        # entity_* в статистике телефонии напрямую не фильтруются стабильно,
+        # поэтому отфильтруем постфактум.
 
-    payloads = [_attach_filters(f) for f in base_filters]
-
-    # Список возможных методов, пробуем по очереди
-    methods = ["telephony.statistic.get", "voximplant.statistic.get"]
-
-    last_error = None
-    for method in methods:
-        for p in payloads:
+        while True:
+            payload = {
+                "FILTER": base_filter,
+                "ORDER": {"CALL_START_DATE": "ASC"},
+                "START": start,
+            }
             try:
-                return _collect_with_paging(method, p)
+                data = _post(method, payload)
             except RuntimeError as e:
-                # Если именно "Method not found" — пробуем следующий метод
-                msg = str(e)
-                if "ERROR_METHOD_NOT_FOUND" in msg or "Method not found" in msg:
-                    last_error = e
-                    break  # к следующему методу
-                # Другие ошибки (например, прав не хватает) — считаем фатальными для этого метода и пробуем следующий
-                last_error = e
-                break
-            except requests.RequestException as e:
-                # сетевые/HTTP ошибки — пробуем следующий вариант
-                last_error = e
-                break
-        else:
-            # если не было break — мы уже вернули результат
-            pass
+                # Method not found — пробуем следующий транспорт
+                if "METHOD_NOT_FOUND" in str(e).upper() or "METHOD NOT FOUND" in str(e).upper():
+                    raise  # сигнал наверх о необходимости фолбэка
+                # Другие ошибки — тоже наверх (пусть решает вызывающий)
+                raise
 
-    # Если ни один метод не сработал — вернём пусто, чтобы не падал /run-scan
-    # (fallback по активностям звонков в logic.py всё равно выполнится)
-    return []
+            page = data.get("result", []) or []
+            res.extend(page)
+            if max_rows is not None and len(res) >= max_rows:
+                return res[:max_rows]
+            next_start = data.get("next")
+            if next_start is None:
+                break
+            start = next_start
+        return res
+
+    # 1) voximplant.statistic.get
+    try:
+        calls = _calls_via("voximplant.statistic.get")
+    except RuntimeError:
+        # 2) telephony.statistic.get
+        try:
+            calls = _calls_via("telephony.statistic.get")
+        except RuntimeError:
+            calls = []
+
+    # Фильтр по связке с сущностью, если просили
+    if calls and (entity_type_id or entity_id):
+        filtered = []
+        for c in calls:
+            # В разных версиях поля называются VOX_* / CRM_* / ENTITY_*
+            et = str(c.get("CRM_ENTITY_TYPE", c.get("ENTITY_TYPE", "")) or "")
+            ei = str(c.get("CRM_ENTITY_ID", c.get("ENTITY_ID", "")) or "")
+            if entity_type_id and et and str(entity_type_id) != et:
+                continue
+            if entity_id and ei and str(entity_id) != ei:
+                continue
+            filtered.append(c)
+        calls = filtered
+
+    # Если телефония недоступна — 3) падение на активности
+    if not calls:
+        flt = {
+            ">CREATED": since_iso,
+            "PROVIDER_ID": ["VOXIMPLANT_CALL", "CALL"],
+        }
+        if entity_type_id is not None:
+            flt["OWNER_TYPE_ID"] = int(entity_type_id)
+        if entity_id is not None:
+            flt["OWNER_ID"] = int(entity_id)
+
+        rows = list_activities(
+            flt,
+            order={"CREATED": "ASC"},
+            select=["ID", "CREATED", "PROVIDER_ID", "DIRECTION", "COMPLETED", "SETTINGS", "OWNER_TYPE_ID", "OWNER_ID"],
+            max_rows=max_rows or 500,
+        )
+        # Приведём к «похожему» формату, чтобы вызывающей стороне было удобно
+        calls = [
+            {
+                "SRC": "crm.activity.list",
+                "CREATED": r.get("CREATED"),
+                "PROVIDER_ID": r.get("PROVIDER_ID"),
+                "DIRECTION": r.get("DIRECTION"),
+                "COMPLETED": r.get("COMPLETED"),
+                "OWNER_TYPE_ID": r.get("OWNER_TYPE_ID"),
+                "OWNER_ID": r.get("OWNER_ID"),
+            }
+            for r in rows
+        ]
+
+    return calls
+
+
+__all__ = [
+    "list_activities",
+    "list_calls_since",
+]
