@@ -78,13 +78,13 @@ def fetch_recent_incoming_messages():
         if str(r.get("OWNER_TYPE_ID")) in TRACK_ENTITY_TYPES and _is_message_activity(r)
     ]
 
-# === Был ли исходящий ответ после входящего ===
+# === Был ли исходящий ответ после входящего (включая ту же минуту/тот же момент) ===
 def has_outgoing_reply_after(entity_type_id, entity_id, t_from_iso: str) -> bool:
     flt = {
         "OWNER_TYPE_ID": int(entity_type_id),
         "OWNER_ID": int(entity_id),
-        ">CREATED": t_from_iso,
-        "DIRECTION": 1,  # outgoing от менеджера
+        ">=CREATED": t_from_iso,   # <-- Главная правка: теперь >= (а не >)
+        "DIRECTION": 1,            # исходящее от менеджера
     }
     # Берём PROVIDER_TYPE_ID, чтобы учесть фильтр по типам
     select = ["ID","CREATED","PROVIDER_ID","PROVIDER_TYPE_ID","AUTHOR_ID"]
@@ -169,7 +169,7 @@ def detect_alerts():
         if (now_utc - t_in).total_seconds() < RESPONSE_SLA_MIN * 60:
             continue
 
-        # Был ли исходящий ответ после входящего
+        # Был ли исходящий ответ после входящего (включая тот же момент)
         if has_outgoing_reply_after(etype, eid, _iso(t_in)):
             continue
 
