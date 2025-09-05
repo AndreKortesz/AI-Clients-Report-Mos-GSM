@@ -1,7 +1,13 @@
 from datetime import datetime, timedelta, timezone
 import os
+from typing import Optional, Tuple
 
 from bitrix import list_activities, list_calls_since
+try:
+    # для REST-вызова im.dialog.messages.get
+    from bitrix import b24  # есть в твоём bitrix.py
+except Exception:
+    b24 = None  # если по какой-то причине не экспортирован — тихий фоллбек
 
 # === Настройки ===
 WINDOW_DAYS = int(os.getenv("WINDOW_DAYS", "14"))
@@ -53,6 +59,57 @@ def _parse_b24_iso(s: str) -> datetime:
         s = s.replace("Z", "+00:00")
     return datetime.fromisoformat(s)
 
+# ---------- Работа с чатами OpenLines/Wazzup ----------
+
+def _extract_dialog_id_from_comms(comms) -> Optional[str]:
+    """
+    Берём первый COMMUNICATIONS с TYPE 'IM' и значением вида
+    'imol|wz_whatsapp_...|15|<uuid>|<lineId>' — это DIALOG_ID для im.dialog.messages.get.
+    """
+    if isinstance(comms, list):
+        for c in comms:
+            if _as_upper(c.get("TYPE")) == "IM":
+                val = str(c.get("VALUE") or "")
+                if val.startswith("imol|"):
+                    return val
+    return None
+
+def _get_last_dialog_message(dialog_id: str) -> Optional[Tuple[dict, dict]]:
+    """
+    Возвращает (message, users_dict) для последнего сообщения в диалоге.
+    message — элемент из result['messages'][0]
+    users_dict — result['users'] (по id можно понять тип автора)
+    """
+    if not b24:
+        return None
+    try:
+        res = b24("im.dialog.messages.get", {
+            "DIALOG_ID": dialog_id,
+            "LIMIT": 1,
+            "SORT": "DESC"
+        })
+        payload = res.get("result") or {}
+        msgs = payload.get("messages") or []
+        users = payload.get("users") or {}
+        if msgs:
+            return msgs[0], users
+    except Exception:
+        return None
+    return None
+
+def _is_user_manager(author_id: int, users_dict: dict) -> bool:
+    """
+    Считаем автора менеджером, если это внутренний пользователь портала (не внешний «connector»).
+    Признаки:
+      - users[author_id].connector == 'Y' у внешних клиентов (мессенджеры)
+      - users[author_id].extranet == 'N' у сотрудников портала
+    Если полей нет — трактуем как внутреннего, если явно не connector.
+    """
+    u = users_dict.get(str(author_id)) or users_dict.get(int(author_id)) or {}
+    connector = str(u.get("connector", "N")).upper()
+    extranet  = str(u.get("extranet", "N")).upper()
+    return connector != "Y" and extranet == "N"
+
 # === Поиск последних входящих сообщений ===
 def fetch_recent_incoming_messages():
     since = datetime.now(timezone.utc) - timedelta(days=WINDOW_DAYS)
@@ -83,10 +140,9 @@ def has_outgoing_reply_after(entity_type_id, entity_id, t_from_iso: str) -> bool
     flt = {
         "OWNER_TYPE_ID": int(entity_type_id),
         "OWNER_ID": int(entity_id),
-        ">=CREATED": t_from_iso,   # <-- Главная правка: теперь >= (а не >)
+        ">=CREATED": t_from_iso,   # важное условие: считаем ответ «в ту же минуту»
         "DIRECTION": 1,            # исходящее от менеджера
     }
-    # Берём PROVIDER_TYPE_ID, чтобы учесть фильтр по типам
     select = ["ID","CREATED","PROVIDER_ID","PROVIDER_TYPE_ID","AUTHOR_ID"]
     rows = list_activities(
         flt,
@@ -100,7 +156,7 @@ def has_outgoing_reply_after(entity_type_id, entity_id, t_from_iso: str) -> bool
     return False
 
 # === Был ли звонок после входящего ===
-def has_success_call_after(entity_type_id, entity_id, t_from_iso: str, phone: str | None) -> bool:
+def has_success_call_after(entity_type_id, entity_id, t_from_iso: str, phone: Optional[str]) -> bool:
     # 1) Журнал телефонии (надёжнее и быстрее)
     calls = list_calls_since(
         t_from_iso,
@@ -113,7 +169,7 @@ def has_success_call_after(entity_type_id, entity_id, t_from_iso: str, phone: st
         if str(c.get("CALL_FAILED", "N")).upper() != "Y":
             return True
 
-    # 2) Фоллбек: активности звонков в CRM (например, VOXIMPLANT_CALL / CALL)
+    # 2) Фоллбек: активности звонков в CRM (VOXIMPLANT_CALL / CALL)
     rows = list_activities(
         {
             "OWNER_TYPE_ID": int(entity_type_id),
@@ -169,15 +225,28 @@ def detect_alerts():
         if (now_utc - t_in).total_seconds() < RESPONSE_SLA_MIN * 60:
             continue
 
-        # Был ли исходящий ответ после входящего (включая тот же момент)
+        # 1) Был ли исходящий ответ после входящего (включая тот же момент)
         if has_outgoing_reply_after(etype, eid, _iso(t_in)):
             continue
 
-        # Был ли звонок после входящего
+        # 2) Для чатов: смотрим реальное последнее сообщение в диалоге (а не время закрытия сессии)
+        prov = _as_upper(last.get("PROVIDER_ID"))
+        dialog_id = _extract_dialog_id_from_comms(last.get("COMMUNICATIONS"))
+        if dialog_id and (prov == "IMOPENLINES_SESSION" or dialog_id.startswith("imol|")):
+            lm = _get_last_dialog_message(dialog_id)
+            if lm:
+                msg, users = lm
+                author_id = int(msg.get("author_id") or msg.get("AUTHOR_ID") or 0)
+                if author_id and _is_user_manager(author_id, users):
+                    # последнее сообщение от менеджера — кейс закрыт
+                    continue
+
+        # 3) Был ли звонок после входящего
         phone = communications_first_phone(last.get("COMMUNICATIONS"))
         if has_success_call_after(etype, eid, _iso(t_in), phone):
             continue
 
+        # 4) иначе — тревога
         alerts.append({
             "owner_type_id": etype,
             "owner_id": eid,
