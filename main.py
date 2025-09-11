@@ -1,51 +1,85 @@
+# main.py — ежедневный запуск в 19:00, с сохранением всех debug-эндпоинтов
+
 import os
-from fastapi import FastAPI, Request
-from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+from fastapi import FastAPI, Request, Query
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
 from logic import detect_alerts
 from telegram_bot import send_message, format_alerts
+from bitrix import list_activities
 
-PORT = int(os.getenv("PORT", "8000"))
-CRON_MINUTES = int(os.getenv("CRON_MINUTES", "60"))  # периодичность скана
+# === Настройки планировщика ===
+TZ_NAME = os.getenv("TIMEZONE", "Europe/Moscow")
+SCHEDULE_HOUR = int(os.getenv("SCHEDULE_HOUR", "19"))
+SCHEDULE_MINUTE = int(os.getenv("SCHEDULE_MINUTE", "0"))
+TZ = ZoneInfo(TZ_NAME)
+
+# (устарело) Переменная CRON_MINUTES больше не используется
+if os.getenv("CRON_MINUTES"):
+    print("[WARN] CRON_MINUTES больше не используется. Расписание задаётся через SCHEDULE_HOUR/SCHEDULE_MINUTE.")
 
 app = FastAPI(title="Bitrix Alerts")
 
-scheduler = BackgroundScheduler(timezone="UTC")
+# === Планировщик: один раз в день ===
+scheduler = AsyncIOScheduler(timezone=TZ)
+
 def job_scan():
+    """Ежедневная задача: собрать тревоги и отправить отчёт в Telegram."""
     try:
         alerts = detect_alerts()
-        if alerts:
-            send_message(format_alerts(alerts))
+        text = format_alerts(alerts)  # твоя функция форматирования
+        # Отправляем ежедневный дайджест всегда (и когда пусто — придёт 'На сейчас тревог нет.')
+        send_message(text)
     except Exception as e:
         send_message(f"❗️Ошибка скана: {e}")
 
-scheduler.add_job(job_scan, "interval", minutes=CRON_MINUTES, id="scan")
-scheduler.start()
+@app.on_event("startup")
+def _on_startup():
+    # Чистим возможные дубликаты (на случай горячего рестарта)
+    for job in scheduler.get_jobs():
+        scheduler.remove_job(job.id)
+
+    trigger = CronTrigger(hour=SCHEDULE_HOUR, minute=SCHEDULE_MINUTE)
+    scheduler.add_job(job_scan, trigger, id="daily_scan")
+    scheduler.start()
+    print(f"[SCHEDULER] План: каждый день в {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} ({TZ_NAME})")
+
+@app.on_event("shutdown")
+def _on_shutdown():
+    scheduler.shutdown(wait=False)
+
+# === Служебные эндпоинты ===
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    now = datetime.now(TZ).isoformat()
+    return {"ok": True, "time": now, "timezone": TZ_NAME}
 
 @app.post("/run-scan")
 async def run_scan():
-    alerts = detect_alerts()
-    txt = format_alerts(alerts)
-    send_message(txt)
-    return {"alerts": alerts, "sent": True}
+    """Ручной запуск из Swagger/curl."""
+    try:
+        alerts = detect_alerts()
+        txt = format_alerts(alerts)
+        send_message(txt)
+        return {"alerts": alerts, "sent": True}
+    except Exception as e:
+        send_message(f"❗️Ошибка скана: {e}")
+        return {"error": str(e)}
 
-# Опционально: приём событий Битрикса (подключишь позже)
+# Приём событий Битрикса (можно расширить позже)
 @app.post("/bitrix/events")
 async def bitrix_events(request: Request):
     data = await request.json()
-    # Здесь можно ловить onCrmActivityAdd / onTelephonyCallEnd и запускать узкий анализ.
-    # Пока просто подтверждаем.
     return {"result": "ok", "echo": data}
 
-from datetime import datetime, timedelta, timezone
-from collections import Counter
-from fastapi import Query
-from bitrix import list_activities
+# === Debug утилиты (сохранены как у тебя) ===
 
-def _iso(dt): 
+def _iso(dt):
     return dt.astimezone(timezone.utc).isoformat()
 
 @app.get("/debug/last-incomings")
@@ -75,8 +109,9 @@ def debug_providers_summary(
 ):
     """
     Сводка по каналам за N дней: сколько входящих по каждому PROVIDER_ID/TYPE.
-    Увеличивай limit, если мало записей.
     """
+    from collections import Counter
+
     since = _iso(datetime.now(timezone.utc) - timedelta(days=days))
     rows = list_activities(
         {"DIRECTION": 2, ">=CREATED": since},
@@ -88,7 +123,6 @@ def debug_providers_summary(
     by_provider = Counter((r.get("PROVIDER_ID") or "").upper() for r in rows)
     by_type = Counter((r.get("PROVIDER_TYPE_ID") or "").upper() for r in rows)
 
-    # Сводка в виде удобного JSON
     return {
         "total_sampled": len(rows),
         "by_PROVIDER_ID": [
