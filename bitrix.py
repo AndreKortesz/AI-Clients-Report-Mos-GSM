@@ -6,12 +6,12 @@ import time
 import typing as t
 import requests
 
-# Базовый URL вебхука
+# === Базовый URL вебхука ===
 _B24 = (os.getenv("B24_WEBHOOK") or "").rstrip("/")
 if not _B24:
     raise RuntimeError("Env B24_WEBHOOK is empty")
 
-# Сетевые таймауты/повторы
+# === Сетевые таймауты/повторы ===
 _HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "25"))
 _RETRY = int(os.getenv("HTTP_RETRY", "2"))
 _RETRY_SLEEP = float(os.getenv("HTTP_RETRY_SLEEP", "0.8"))
@@ -20,17 +20,17 @@ def _method_url(method: str) -> str:
     return f"{_B24}/{method}.json"
 
 def _post(method: str, payload: dict) -> dict:
-    """Вызов метода Bitrix с базовой обработкой ошибок.
-    Любые сетевые/HTTP ошибки конвертируем в RuntimeError,
-    чтобы верхний уровень мог нормально сделать фоллбек.
+    """
+    Вызов метода Bitrix с базовой обработкой ошибок.
+    Любые сетевые/HTTP/битрикс-ошибки -> RuntimeError (для верхнего уровня и фоллбеков).
     """
     url = _method_url(method)
-    last_exc = None
+    last_exc: Exception | None = None
+
     for i in range(_RETRY + 1):
         try:
             r = requests.post(url, json=payload, timeout=_HTTP_TIMEOUT)
-
-            # Попробуем разобрать JSON даже при 404
+            # попробуем разобрать JSON даже при ошибочном статусе
             try:
                 data = r.json()
             except ValueError:
@@ -44,7 +44,7 @@ def _post(method: str, payload: dict) -> dict:
             if isinstance(data, dict) and "error" in data:
                 raise RuntimeError(f"{data.get('error')}: {data.get('error_description')}")
 
-            return data
+            return data or {}
 
         except (requests.RequestException, RuntimeError) as e:
             last_exc = e
@@ -54,23 +54,19 @@ def _post(method: str, payload: dict) -> dict:
 
     raise RuntimeError(str(last_exc) if last_exc else "Unknown request failure")
 
-# ---------------------------
-#  Public helpers for logic.py
-# ---------------------------
+# Экспортируем «сырой» вызов как публичный helper
+def b24(method: str, params: dict) -> dict:
+    return _post(method, params)
 
+# ---------------------------
+#  crm.activity.list (постранично)
+# ---------------------------
 def list_activities(
     flt: dict | None = None,
     order: dict | None = None,
     select: t.List[str] | None = None,
     max_rows: int | None = None,
 ) -> t.List[dict]:
-    """
-    Обёртка над crm.activity.list с постраничной выборкой.
-    :param flt: FILTER
-    :param order: ORDER
-    :param select: SELECT
-    :param max_rows: жёсткая отсечка по количеству записей
-    """
     method = "crm.activity.list"
     result: t.List[dict] = []
     start: t.Any = 0
@@ -95,7 +91,9 @@ def list_activities(
         start = next_start
     return result
 
-
+# ---------------------------
+#  Журнал звонков (телефония) + фоллбек на активности
+# ---------------------------
 def list_calls_since(
     since_iso: str,
     *,
@@ -105,13 +103,11 @@ def list_calls_since(
     max_rows: int | None = 2000,
 ) -> t.List[dict]:
     """
-    Возвращает список звонков (журнал телефонии) НОВЕЕ указанной даты.
     Порядок попыток:
-      1) voximplant.statistic.get (классический)
-      2) telephony.statistic.get (на некоторых порталах)
-      3) Fallback: crm.activity.list с PROVIDER_ID=["VOXIMPLANT_CALL","CALL"]
+      1) voximplant.statistic.get
+      2) telephony.statistic.get
+      3) crm.activity.list (PROVIDER_ID in ["VOXIMPLANT_CALL","CALL"])
     """
-
     def _calls_via(method: str) -> t.List[dict]:
         res: t.List[dict] = []
         start = 0
@@ -143,19 +139,18 @@ def list_calls_since(
             start = next_start
         return res
 
-    # 1) voximplant.statistic.get
+    # 1) и 2)
     try:
         calls = _calls_via("voximplant.statistic.get")
     except RuntimeError:
-        # 2) telephony.statistic.get
         try:
             calls = _calls_via("telephony.statistic.get")
         except RuntimeError:
             calls = []
 
-    # Фильтр по сущности (если указан)
+    # Фильтрация по сущности, если указана
     if calls and (entity_type_id or entity_id):
-        filtered = []
+        filtered: t.List[dict] = []
         for c in calls:
             et = str(c.get("CRM_ENTITY_TYPE", c.get("ENTITY_TYPE", "")) or "")
             ei = str(c.get("CRM_ENTITY_ID", c.get("ENTITY_ID", "")) or "")
@@ -166,7 +161,7 @@ def list_calls_since(
             filtered.append(c)
         calls = filtered
 
-    # Если телефония недоступна — fallback на crm.activity.list
+    # 3) Фоллбек на активности звонков
     if not calls:
         flt = {
             ">CREATED": since_iso,
@@ -180,7 +175,10 @@ def list_calls_since(
         rows = list_activities(
             flt,
             order={"CREATED": "ASC"},
-            select=["ID", "CREATED", "PROVIDER_ID", "DIRECTION", "COMPLETED", "SETTINGS", "OWNER_TYPE_ID", "OWNER_ID"],
+            select=[
+                "ID", "CREATED", "PROVIDER_ID", "DIRECTION",
+                "COMPLETED", "SETTINGS", "OWNER_TYPE_ID", "OWNER_ID"
+            ],
             max_rows=max_rows or 500,
         )
         calls = [
@@ -198,14 +196,41 @@ def list_calls_since(
 
     return calls
 
+# ---------------------------
+#  OpenLines / Wazzup: чтение последних сообщений диалога
+# ---------------------------
+def get_last_openlines_messages(dialog_id: str, limit: int = 1) -> dict:
+    """
+    Обёртка над im.dialog.messages.get.
+    Возвращает dict с ключами: {"messages": [...], "users": {...}}
+    """
+    data = _post("im.dialog.messages.get", {
+        "DIALOG_ID": dialog_id,
+        "LIMIT": int(limit),
+        "SORT": "DESC"
+    })
+    res = data.get("result") or {}
+    # Нормализуем
+    return {
+        "messages": res.get("messages") or [],
+        "users": res.get("users") or {}
+    }
 
-# Экспортируем b24 для прямых вызовов (например, чтение сообщений из диалогов)
-def b24(method: str, params: dict) -> dict:
-    return _post(method, params)
-
+def get_last_openlines_message(dialog_id: str) -> tuple[dict, dict] | None:
+    """
+    Удобный хелпер: одно последнее сообщение и справочник пользователей.
+    Возвращает (message, users) или None.
+    """
+    payload = get_last_openlines_messages(dialog_id, limit=1)
+    msgs = payload.get("messages") or []
+    if not msgs:
+        return None
+    return msgs[0], (payload.get("users") or {})
 
 __all__ = [
+    "b24",
     "list_activities",
     "list_calls_since",
-    "b24",
+    "get_last_openlines_messages",
+    "get_last_openlines_message",
 ]
