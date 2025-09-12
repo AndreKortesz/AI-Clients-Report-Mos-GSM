@@ -199,44 +199,70 @@ def _last_sender_is_operator_for_openlines(last_activity: dict) -> bool | None:
 
 # === Главный детектор тревог ===
 def detect_alerts():
+    """
+    Возвращает список словарей:
+    {
+      'owner_type_id', 'owner_id', 'last_in_created',
+      'provider_id', 'phone', 'activity_id', 'subject'
+    }
+    """
     incomings = fetch_recent_incoming_messages()
     alerts = []
 
-    # Последнее входящее на сущность
+    # Берём только ПОСЛЕДНЕЕ входящее по каждой сущности
     latest_by_entity: dict[tuple[str, str], dict] = {}
     for r in incomings:
         key = (str(r["OWNER_TYPE_ID"]), str(r["OWNER_ID"]))
         if key not in latest_by_entity:
-            latest_by_entity[key] = r  # DESC
+            latest_by_entity[key] = r  # уже отсортировано DESC
 
     now_utc = datetime.now(timezone.utc)
 
     for (etype, eid), last in latest_by_entity.items():
+        # Парсим дату входящего
         created_raw = str(last.get("CREATED"))
         t_in = _parse_b24_iso(created_raw)
 
-        # SLA окно
+        # Ждём SLA
         if (now_utc - t_in).total_seconds() < RESPONSE_SLA_MIN * 60:
             continue
 
-        # 1) Если это сессия ОЛ — сначала проверим **реального** последнего автора сообщения
-        ol_last_sender = _last_sender_is_operator_for_openlines(last)
-        if ol_last_sender is True:
-            # последним писал оператор — тревогу НЕ поднимаем
-            continue
-        # Если False — последним был клиент (идём дальше проверять звонок)
-        # Если None — не смогли определить, fallback на старую логику
-
-        # 2) Был ли исходящий текстовый ответ после входящего (>= тот же момент)
-        #    Для email/прочих каналов это остаётся актуальным
+        # 1) Был ли исходящий ответ после входящего (включая тот же момент)
         if has_outgoing_reply_after(etype, eid, _iso(t_in)):
             continue
 
-        # 3) Был ли звонок после входящего
+        # 2) Для чатов OpenLines/Wazzup: проверяем именно ПОСЛЕДНЕЕ сообщение в диалоге,
+        #    а не время закрытия сессии (ключевая логика).
+        prov = _as_upper(last.get("PROVIDER_ID"))
+        dialog_id = _extract_dialog_id_from_comms(last.get("COMMUNICATIONS"))
+
+        # ЖЁСТКАЯ защита: не ходим в im.dialog.messages.get без валидного dialog_id
+        if dialog_id:
+            dialog_id_str = str(dialog_id).strip()
+        else:
+            dialog_id_str = ""
+
+        if dialog_id_str and (prov == "IMOPENLINES_SESSION" or dialog_id_str.startswith("imol|")):
+            try:
+                lm = _get_last_dialog_message(dialog_id_str)
+            except Exception:
+                lm = None  # при любой ошибке не валимся, продолжаем обычные проверки
+
+            if lm:
+                msg, users = lm
+                author_id = int(msg.get("author_id") or msg.get("AUTHOR_ID") or 0)
+                # если последнее сообщение от МЕНЕДЖЕРА — тревогу не формируем
+                if author_id and _is_user_manager(author_id, users):
+                    continue
+                # если последнее сообщение от клиента — оставляем кейс на дальнейшие проверки
+        # если dialog_id отсутствует или пустой — просто не делаем вызов к im.dialog.messages.get
+
+        # 3) Был ли звонок после входящего (любой успешный)
         phone = communications_first_phone(last.get("COMMUNICATIONS"))
         if has_success_call_after(etype, eid, _iso(t_in), phone):
             continue
 
+        # 4) иначе — тревога
         alerts.append({
             "owner_type_id": etype,
             "owner_id": eid,
