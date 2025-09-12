@@ -1,6 +1,7 @@
 # logic.py
 from datetime import datetime, timedelta, timezone
 import os
+import re
 
 from bitrix import list_activities, list_calls_since, get_last_openlines_messages
 
@@ -55,20 +56,45 @@ def _parse_b24_iso(s: str) -> datetime:
         s = s.replace("Z", "+00:00")
     return datetime.fromisoformat(s)
 
-def _extract_dialog_id_from_comms(comms) -> str | None:
+def _extract_dialog_id(row: dict) -> Optional[str]:
     """
-    COMMUNICATIONS[].VALUE для ОЛ выглядит как:
-    'imol|wz_whatsapp_...|15|53a528ba-...|35855'
-    Нам нужен этот VALUE целиком как DIALOG_ID.
-    Берём первый TYPE='IM' с префиксом 'imol|'.
+    Пытаемся достать DIALOG_ID для OpenLines/Wazzup несколькими способами.
+    Принимаем строку вида 'imol|wz_whatsapp_...|15|<uuid>|<lineId>'.
     """
-    if not isinstance(comms, list):
-        return None
-    for c in comms:
-        if (c or {}).get("TYPE") == "IM":
-            val = str(c.get("VALUE") or "")
-            if val.startswith("imol|"):
-                return val
+    # 1) COMMUNICATIONS (IM)
+    comms = row.get("COMMUNICATIONS")
+    if isinstance(comms, list):
+        for c in comms:
+            if _as_upper(c.get("TYPE")) == "IM":
+                val = str(c.get("VALUE") or "")
+                if val.startswith("imol|"):
+                    return val
+
+    # 2) SETTINGS (встречаются разные ключи)
+    st = row.get("SETTINGS") or {}
+    for key in (
+        "DIALOG_ID", "DIALOGID", "IM_DIALOG_ID", "IMOL_DIALOG_ID", "IMOL_CHAT_ID"
+    ):
+        v = st.get(key) or st.get(key.lower())
+        if v:
+            v = str(v)
+            if v.startswith("imol|"):
+                return v
+
+    # 3) SUBJECT и DESCRIPTION (регэкспом)
+    for field in ("DESCRIPTION", "SUBJECT"):
+        s = row.get(field) or ""
+        m = re.search(r"(imol\|[^\s\"']+)", str(s))
+        if m:
+            return m.group(1)
+
+    # 4) PROVIDER_PARAMS (иногда сюда прокидывают служебные поля)
+    pp = row.get("PROVIDER_PARAMS") or {}
+    for k, v in (pp.items() if isinstance(pp, dict) else []):
+        v = str(v)
+        if v.startswith("imol|"):
+            return v
+
     return None
 
 # === Поиск последних входящих сообщений ===
@@ -78,9 +104,11 @@ def fetch_recent_incoming_messages():
         ">=CREATED": _iso(since),
         "DIRECTION": 2,  # incoming от клиента
     }
+    # Важно: добавили SETTINGS и PROVIDER_PARAMS
     select = [
         "ID","CREATED","PROVIDER_ID","PROVIDER_TYPE_ID","SUBJECT",
-        "OWNER_TYPE_ID","OWNER_ID","COMMUNICATIONS","AUTHOR_ID","DESCRIPTION"
+        "OWNER_TYPE_ID","OWNER_ID","COMMUNICATIONS","AUTHOR_ID",
+        "DESCRIPTION","SETTINGS","PROVIDER_PARAMS"
     ]
     rows = list_activities(
         flt,
@@ -234,7 +262,7 @@ def detect_alerts():
         # 2) Для чатов OpenLines/Wazzup: проверяем именно ПОСЛЕДНЕЕ сообщение в диалоге,
         #    а не время закрытия сессии (ключевая логика).
         prov = _as_upper(last.get("PROVIDER_ID"))
-        dialog_id = _extract_dialog_id_from_comms(last.get("COMMUNICATIONS"))
+        dialog_id = _extract_dialog_id(last)
 
         # ЖЁСТКАЯ защита: не ходим в im.dialog.messages.get без валидного dialog_id
         if dialog_id:
